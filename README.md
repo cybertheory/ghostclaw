@@ -484,10 +484,13 @@ Want to contribute? Head to [GitHub](https://github.com/cybertheory/ghostclaw) a
 
 This project is licensed under the **GNU General Public License v3.0** - see the [LICENSE](LICENSE) file for details.
 
+GhostClaw is based on [Pluely](https://github.com/iamsrikanthnani/pluely). We distribute under the same **GPL v3** license and preserve the original license and attribution as required. The [LICENSE](LICENSE) file contains the full terms; modified works must retain these notices.
+
 ---
 
 ## 🙏 Acknowledgments
 
+- **[Pluely](https://github.com/iamsrikanthnani/pluely)** - Open source project this was forked from
 - **[Cluely](https://cluely.com/)** - Inspiration for this open source alternative
 - **[Tauri](https://tauri.app/)** - Amazing desktop framework
 - **[tauri-nspanel](https://github.com/ahkohd/tauri-nspanel)** - macOS native panel integration for Tauri
