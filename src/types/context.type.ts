@@ -40,11 +40,8 @@ export type IContextType = {
   toggleAlwaysOnTop: (isEnabled: boolean) => Promise<void>;
   toggleAutostart: (isEnabled: boolean) => Promise<void>;
   loadData: () => void;
-  pluelyApiEnabled: boolean;
-  setPluelyApiEnabled: (enabled: boolean) => Promise<void>;
+  /** Always true; no license required for GhostClaw. */
   hasActiveLicense: boolean;
-  setHasActiveLicense: Dispatch<SetStateAction<boolean>>;
-  getActiveLicenseStatus: () => Promise<void>;
   selectedAudioDevices: {
     input: { id: string; name: string };
     output: { id: string; name: string };

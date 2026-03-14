@@ -11,7 +11,6 @@ import {
 } from "@/config";
 import {
   safeLocalStorage,
-  shouldUsePluelyAPI,
   generateConversationTitle,
   saveConversation,
   CONVERSATION_SAVE_DEBOUNCE_MS,
@@ -235,8 +234,7 @@ export function useSystemAudio() {
             }
             const audioBlob = new Blob([bytes], { type: "audio/wav" });
 
-            const usePluelyAPI = await shouldUsePluelyAPI();
-            if (!selectedSttProvider.provider && !usePluelyAPI) {
+            if (!selectedSttProvider.provider) {
               setError("No speech provider selected.");
               return;
             }
@@ -245,7 +243,7 @@ export function useSystemAudio() {
               (p) => p.id === selectedSttProvider.provider
             );
 
-            if (!providerConfig && !usePluelyAPI) {
+            if (!providerConfig) {
               setError("Speech provider config not found.");
               return;
             }
@@ -487,23 +485,22 @@ export function useSystemAudio() {
 
         let fullResponse = "";
 
-        const usePluelyAPI = await shouldUsePluelyAPI();
-        if (!selectedAIProvider.provider && !usePluelyAPI) {
-          setError("No AI provider selected.");
+        if (!selectedAIProvider.provider) {
+          setError("OpenClaw is not configured. Set the base URL in Dashboard.");
           return;
         }
 
         const provider = allAiProviders.find(
           (p) => p.id === selectedAIProvider.provider
         );
-        if (!provider && !usePluelyAPI) {
+        if (!provider) {
           setError("AI provider config not found.");
           return;
         }
 
         try {
           for await (const chunk of fetchAIResponse({
-            provider: usePluelyAPI ? undefined : provider,
+            provider,
             selectedProvider: selectedAIProvider,
             systemPrompt: prompt,
             history: previousMessages,

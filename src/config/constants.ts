@@ -13,7 +13,11 @@ export const STORAGE_KEYS = {
   SYSTEM_AUDIO_CONTEXT: "system_audio_context",
   SYSTEM_AUDIO_QUICK_ACTIONS: "system_audio_quick_actions",
   CUSTOMIZABLE: "customizable",
-  PLUELY_API_ENABLED: "pluely_api_enabled",
+  OPENCLAW_BASE_URL: "openclaw_base_url",
+  OPENCLAW_API_TOKEN: "openclaw_api_token",
+  OPENCLAW_AGENT_ID: "openclaw_agent_id",
+  OPENCLAW_MODE: "openclaw_mode",
+  OPENCLAW_SESSION_USER: "openclaw_session_user",
   SHORTCUTS: "shortcuts",
   AUTOSTART_INITIALIZED: "autostart_initialized",
 

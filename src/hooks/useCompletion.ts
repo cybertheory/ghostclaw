@@ -8,7 +8,6 @@ import {
   saveConversation,
   getConversationById,
   generateConversationTitle,
-  shouldUsePluelyAPI,
   MESSAGE_ID_OFFSET,
   generateConversationId,
   generateMessageId,
@@ -179,12 +178,10 @@ export const useCompletion = () => {
 
         let fullResponse = "";
 
-        const usePluelyAPI = await shouldUsePluelyAPI();
-        // Check if AI provider is configured
-        if (!selectedAIProvider.provider && !usePluelyAPI) {
+        if (!selectedAIProvider.provider) {
           setState((prev) => ({
             ...prev,
-            error: "Please select an AI provider in settings",
+            error: "OpenClaw is not configured. Set the base URL in Dashboard.",
           }));
           return;
         }
@@ -192,7 +189,7 @@ export const useCompletion = () => {
         const provider = allAiProviders.find(
           (p) => p.id === selectedAIProvider.provider
         );
-        if (!provider && !usePluelyAPI) {
+        if (!provider) {
           setState((prev) => ({
             ...prev,
             error: "Invalid provider selected",
@@ -211,7 +208,7 @@ export const useCompletion = () => {
         try {
           // Use the fetchAIResponse function with signal
           for await (const chunk of fetchAIResponse({
-            provider: usePluelyAPI ? undefined : provider,
+            provider,
             selectedProvider: selectedAIProvider,
             systemPrompt: systemPrompt || undefined,
             history: messageHistory,
@@ -582,12 +579,10 @@ export const useCompletion = () => {
 
             let fullResponse = "";
 
-            const usePluelyAPI = await shouldUsePluelyAPI();
-            // Check if AI provider is configured
-            if (!selectedAIProvider.provider && !usePluelyAPI) {
+            if (!selectedAIProvider.provider) {
               setState((prev) => ({
                 ...prev,
-                error: "Please select an AI provider in settings",
+                error: "OpenClaw is not configured. Set the base URL in Dashboard.",
               }));
               return;
             }
@@ -595,7 +590,7 @@ export const useCompletion = () => {
             const provider = allAiProviders.find(
               (p) => p.id === selectedAIProvider.provider
             );
-            if (!provider && !usePluelyAPI) {
+            if (!provider) {
               setState((prev) => ({
                 ...prev,
                 error: "Invalid provider selected",
@@ -614,7 +609,7 @@ export const useCompletion = () => {
 
             // Use the fetchAIResponse function with image and signal
             for await (const chunk of fetchAIResponse({
-              provider: usePluelyAPI ? undefined : provider,
+              provider,
               selectedProvider: selectedAIProvider,
               systemPrompt: systemPrompt || undefined,
               history: messageHistory,
@@ -876,7 +871,7 @@ export const useCompletion = () => {
             setState((prev) => ({
               ...prev,
               error:
-                "Screen Recording permission required. Please enable it by going to System Settings > Privacy & Security > Screen & System Audio Recording. If you don't see Pluely in the list, click the '+' button to add it. If it's already listed, make sure it's enabled. Then restart the app.",
+                "Screen Recording permission required. Please enable it by going to System Settings > Privacy & Security > Screen & System Audio Recording. If you don't see GhostClaw in the list, click the '+' button to add it. If it's already listed, make sure it's enabled. Then restart the app.",
             }));
             setIsScreenshotLoading(false);
             screenshotInitiatedByThisContext.current = false;

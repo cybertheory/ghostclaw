@@ -1,19 +1,15 @@
-import {
-  buildDynamicMessages,
-  deepVariableReplacer,
-  extractVariables,
-  getByPath,
-  getStreamingContent,
-} from "./common.function";
-import { Message, TYPE_PROVIDER } from "@/types";
-import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import curl2Json from "@bany/curl-to-json";
-import { shouldUsePluelyAPI } from "./pluely.api";
-import { CHUNK_POLL_INTERVAL_MS } from "../chat-constants";
+import { getStreamingContent } from "./common.function";
+import { Message } from "@/types";
 import { getResponseSettings, RESPONSE_LENGTHS, LANGUAGES } from "@/lib";
-import { MARKDOWN_FORMATTING_INSTRUCTIONS } from "@/config/constants";
+import {
+  MARKDOWN_FORMATTING_INSTRUCTIONS,
+  STORAGE_KEYS,
+} from "@/config/constants";
+import { safeLocalStorage } from "@/lib/storage";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+export type OpenClawMode = "responses" | "completions";
 
 function buildEnhancedSystemPrompt(baseSystemPrompt?: string): string {
   const responseSettings = getResponseSettings();
@@ -43,126 +39,401 @@ function buildEnhancedSystemPrompt(baseSystemPrompt?: string): string {
   return prompts.join(" ");
 }
 
-// Pluely AI streaming function
-async function* fetchPluelyAIResponse(params: {
+/** Build OpenAI-format messages for OpenClaw Gateway. */
+function buildOpenClawMessages(
+  systemPrompt: string,
+  history: Message[],
+  userMessage: string,
+  imagesBase64: string[] = []
+): { role: string; content: string | { type: string; text?: string; image_url?: { url: string } }[] }[] {
+  const messages: { role: string; content: string | { type: string; text?: string; image_url?: { url: string } }[] }[] = [];
+  if (systemPrompt?.trim()) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+  for (const msg of history) {
+    messages.push({ role: msg.role, content: msg.content });
+  }
+  if (imagesBase64.length > 0) {
+    const parts: { type: string; text?: string; image_url?: { url: string } }[] = [
+      { type: "text", text: userMessage },
+    ];
+    for (const b64 of imagesBase64) {
+      parts.push({
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${b64}` },
+      });
+    }
+    messages.push({ role: "user", content: parts });
+  } else {
+    messages.push({ role: "user", content: userMessage });
+  }
+  return messages;
+}
+
+/** Build a single prompt string for WebSocket fallback (Gateway chat has one "text" field). */
+function buildOpenClawChatText(
+  systemPrompt: string,
+  history: Message[],
+  userMessage: string
+): string {
+  const parts: string[] = [];
+  if (systemPrompt?.trim()) {
+    parts.push(systemPrompt.trim());
+  }
+  for (const msg of history) {
+    const role = msg.role === "user" ? "User" : msg.role === "assistant" ? "Assistant" : "System";
+    parts.push(`${role}: ${msg.content}`);
+  }
+  parts.push(`User: ${userMessage}`);
+  return parts.join("\n\n");
+}
+
+/** OpenClaw Gateway WebSocket fallback (no streaming; returns full response). */
+async function* fetchOpenClawViaWebSocket(params: {
+  systemPrompt?: string;
+  userMessage: string;
+  history?: Message[];
+  baseUrl: string;
+  apiToken: string;
+  agentId: string;
+  signal?: AbortSignal;
+}): AsyncIterable<string> {
+  const wsUrl = params.baseUrl
+    .replace(/^http:\/\//i, "ws://")
+    .replace(/^https:\/\//i, "wss://")
+    .replace(/\/$/, "");
+  const url = params.apiToken
+    ? `${wsUrl}?token=${encodeURIComponent(params.apiToken)}`
+    : wsUrl;
+  const text = buildOpenClawChatText(
+    params.systemPrompt || "",
+    params.history || [],
+    params.userMessage
+  );
+  const result = await new Promise<string>((resolve) => {
+    const ws = new WebSocket(url);
+    const id = `ghostclaw-${Date.now()}`;
+    let done = false;
+    const finish = (value: string) => {
+      if (!done) {
+        done = true;
+        try {
+          ws.close();
+        } catch {}
+        resolve(value);
+      }
+    };
+    params.signal?.addEventListener("abort", () => finish(""));
+    ws.onopen = () => {
+      ws.send(
+        JSON.stringify({
+          type: "chat",
+          id,
+          payload: {
+            text,
+            context: {},
+            options: { no_memory: false },
+          },
+        })
+      );
+    };
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+        if (msg.type === "response" && msg.id === id && msg.payload?.text != null) {
+          finish(msg.payload.text as string);
+        } else if (msg.type === "error" && msg.payload?.message) {
+          finish(`OpenClaw error: ${msg.payload.message}`);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    ws.onerror = () => finish("OpenClaw WebSocket connection failed.");
+    ws.onclose = () => {
+      if (!done) finish("OpenClaw WebSocket closed before response.");
+    };
+  });
+  if (result) yield result;
+}
+
+/** OpenClaw OpenResponses API streaming (/v1/responses). Session-persistent and faster for follow-ups. */
+async function* fetchOpenClawViaResponses(params: {
   systemPrompt?: string;
   userMessage: string;
   imagesBase64?: string[];
   history?: Message[];
   signal?: AbortSignal;
 }): AsyncIterable<string> {
+  const baseUrl = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_BASE_URL)?.trim();
+  if (!baseUrl) {
+    yield "OpenClaw base URL is not configured. Set it in Dashboard → OpenClaw connection.";
+    return;
+  }
+  const apiToken = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_API_TOKEN)?.trim() ?? "";
+  const agentId = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_AGENT_ID)?.trim() || "main";
+  const sessionUser = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_SESSION_USER)?.trim() || "ghostclaw";
+
+  const url = `${baseUrl.replace(/\/$/, "")}/v1/responses`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiToken) headers["Authorization"] = `Bearer ${apiToken}`;
+  headers["x-openclaw-agent-id"] = agentId;
+
+  const input: { type: string; role?: string; content?: string | { type: string; text?: string; image_url?: { url: string } }[] }[] = [];
+  if (params.systemPrompt?.trim()) {
+    input.push({ type: "message", role: "system", content: params.systemPrompt });
+  }
+  for (const msg of (params.history || [])) {
+    input.push({ type: "message", role: msg.role, content: msg.content });
+  }
+  if (params.imagesBase64?.length) {
+    const parts: { type: string; text?: string; image_url?: { url: string } }[] = [
+      { type: "input_text", text: params.userMessage },
+    ];
+    for (const b64 of params.imagesBase64) {
+      parts.push({ type: "input_image", image_url: { url: `data:image/png;base64,${b64}` } } as any);
+    }
+    input.push({ type: "message", role: "user", content: parts as any });
+  } else {
+    input.push({ type: "message", role: "user", content: params.userMessage });
+  }
+
+  const body = {
+    model: `openclaw:${agentId}`,
+    input,
+    stream: true,
+    user: sessionUser,
+  };
+
+  const streamId = `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  type StreamChunk = { stream_id: string; data: string; done: boolean; error: string | null };
+
+  const chunks: string[] = [];
+  let streamDone = false;
+  let streamError: string | null = null;
+  let resolveWaiting: (() => void) | null = null;
+
+  let unlisten: UnlistenFn | null = null;
   try {
-    const {
-      systemPrompt,
-      userMessage,
-      imagesBase64 = [],
-      history = [],
-      signal,
-    } = params;
-
-    // Check if already aborted before starting
-    if (signal?.aborted) {
-      return;
-    }
-
-    // Convert history to the expected format
-    let historyString: string | undefined;
-    if (history.length > 0) {
-      // Create a copy before reversing to avoid mutating the original array
-      const formattedHistory = [...history].reverse().map((msg) => ({
-        role: msg.role,
-        content: [{ type: "text", text: msg.content }],
-      }));
-      historyString = JSON.stringify(formattedHistory);
-    }
-
-    // Handle images - can be string or array
-    let imageBase64: any = undefined;
-    if (imagesBase64.length > 0) {
-      imageBase64 = imagesBase64.length === 1 ? imagesBase64[0] : imagesBase64;
-    }
-
-    // Set up streaming event listener
-    let streamComplete = false;
-    const streamChunks: string[] = [];
-
-    const unlisten = await listen("chat_stream_chunk", (event) => {
-      const chunk = event.payload as string;
-      streamChunks.push(chunk);
+    unlisten = await listen<StreamChunk>("openclaw-stream", (event) => {
+      if (event.payload.stream_id !== streamId) return;
+      if (event.payload.error) {
+        streamError = event.payload.error;
+        streamDone = true;
+      } else if (event.payload.done) {
+        streamDone = true;
+      } else if (event.payload.data) {
+        chunks.push(event.payload.data);
+      }
+      if (resolveWaiting) {
+        resolveWaiting();
+        resolveWaiting = null;
+      }
     });
 
-    const unlistenComplete = await listen("chat_stream_complete", () => {
-      streamComplete = true;
+    invoke("openclaw_stream", {
+      streamId,
+      request: { url, headers, body: JSON.stringify(body) },
+    }).catch((e) => {
+      streamError = e instanceof Error ? e.message : String(e);
+      streamDone = true;
+      if (resolveWaiting) {
+        resolveWaiting();
+        resolveWaiting = null;
+      }
     });
 
-    try {
-      // Check if aborted before starting invoke
-      if (signal?.aborted) {
-        unlisten();
-        unlistenComplete();
+    let sseBuffer = "";
+
+    while (true) {
+      if (params.signal?.aborted) return;
+
+      if (chunks.length === 0 && !streamDone) {
+        await new Promise<void>((resolve) => {
+          resolveWaiting = resolve;
+          setTimeout(resolve, 100);
+        });
+        continue;
+      }
+
+      if (streamError) {
+        const errMsg = streamError as string;
+        if (errMsg.includes("404") || errMsg.includes("501")) {
+          yield "OpenResponses endpoint not available. Enable it in OpenClaw config: gateway.http.endpoints.responses.enabled: true";
+          return;
+        }
+        yield `OpenClaw request failed: ${errMsg}`;
         return;
       }
 
-      // Start the streaming request using the new API response endpoint
-      await invoke("chat_stream_response", {
-        userMessage,
-        systemPrompt,
-        imageBase64,
-        history: historyString,
-      });
-
-      // Yield chunks as they come in
-      let lastIndex = 0;
-      while (!streamComplete) {
-        // Check if aborted during streaming
-        if (signal?.aborted) {
-          unlisten();
-          unlistenComplete();
-          return;
+      while (chunks.length > 0) {
+        if (params.signal?.aborted) return;
+        sseBuffer += chunks.shift()!;
+        const lines = sseBuffer.split("\n");
+        sseBuffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("data:")) {
+            const trimmed = line.substring(5).trim();
+            if (!trimmed || trimmed === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (parsed.type === "response.output_text.delta" && parsed.delta) {
+                yield parsed.delta;
+              }
+            } catch {
+              // partial JSON
+            }
+          }
         }
-
-        // Wait a bit for chunks to accumulate
-        await new Promise((resolve) =>
-          setTimeout(resolve, CHUNK_POLL_INTERVAL_MS)
-        );
-
-        // Check again after timeout
-        if (signal?.aborted) {
-          unlisten();
-          unlistenComplete();
-          return;
-        }
-
-        // Yield any new chunks
-        for (let i = lastIndex; i < streamChunks.length; i++) {
-          yield streamChunks[i];
-        }
-        lastIndex = streamChunks.length;
       }
 
-      // Final abort check before yielding remaining chunks
-      if (signal?.aborted) {
-        unlisten();
-        unlistenComplete();
+      if (streamDone) break;
+    }
+  } finally {
+    if (unlisten) unlisten();
+  }
+}
+
+/** OpenClaw Gateway (OpenAI Chat Completions) streaming; falls back to WebSocket on 404. */
+async function* fetchOpenClawViaChatCompletions(params: {
+  systemPrompt?: string;
+  userMessage: string;
+  imagesBase64?: string[];
+  history?: Message[];
+  signal?: AbortSignal;
+}): AsyncIterable<string> {
+  const baseUrl = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_BASE_URL)?.trim();
+  if (!baseUrl) {
+    yield "OpenClaw base URL is not configured. Set it in Dashboard → OpenClaw connection.";
+    return;
+  }
+  const apiToken = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_API_TOKEN)?.trim() ?? "";
+  const agentId = safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_AGENT_ID)?.trim() || "main";
+
+  const url = `${baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (apiToken) {
+    headers["Authorization"] = `Bearer ${apiToken}`;
+  }
+  headers["x-openclaw-agent-id"] = agentId;
+
+  const messages = buildOpenClawMessages(
+    params.systemPrompt || "",
+    params.history || [],
+    params.userMessage,
+    params.imagesBase64 || []
+  );
+
+  const body = {
+    model: agentId,
+    messages,
+    stream: true,
+  };
+
+  const streamId = `oc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  type StreamChunk = { stream_id: string; data: string; done: boolean; error: string | null };
+
+  const chunks: string[] = [];
+  let streamDone = false;
+  let streamError: string | null = null;
+  let resolveWaiting: (() => void) | null = null;
+
+  let unlisten: UnlistenFn | null = null;
+  try {
+    unlisten = await listen<StreamChunk>("openclaw-stream", (event) => {
+      if (event.payload.stream_id !== streamId) return;
+      if (event.payload.error) {
+        streamError = event.payload.error;
+        streamDone = true;
+      } else if (event.payload.done) {
+        streamDone = true;
+      } else if (event.payload.data) {
+        chunks.push(event.payload.data);
+      }
+      if (resolveWaiting) {
+        resolveWaiting();
+        resolveWaiting = null;
+      }
+    });
+
+    invoke("openclaw_stream", {
+      streamId,
+      request: { url, headers, body: JSON.stringify(body) },
+    }).catch((e) => {
+      streamError = e instanceof Error ? e.message : String(e);
+      streamDone = true;
+      if (resolveWaiting) {
+        resolveWaiting();
+        resolveWaiting = null;
+      }
+    });
+
+    let sseBuffer = "";
+
+    while (true) {
+      if (params.signal?.aborted) return;
+
+      if (chunks.length === 0 && !streamDone) {
+        await new Promise<void>((resolve) => {
+          resolveWaiting = resolve;
+          setTimeout(resolve, 100);
+        });
+        continue;
+      }
+
+      if (streamError) {
+        const errMsg = streamError as string;
+        if (errMsg.includes("404") || errMsg.includes("501")) {
+          yield* fetchOpenClawViaWebSocket({
+            systemPrompt: params.systemPrompt,
+            userMessage: params.userMessage,
+            history: params.history,
+            baseUrl,
+            apiToken,
+            agentId,
+            signal: params.signal,
+          });
+          return;
+        }
+        yield `OpenClaw request failed: ${streamError}`;
         return;
       }
 
-      // Yield any remaining chunks
-      for (let i = lastIndex; i < streamChunks.length; i++) {
-        yield streamChunks[i];
+      while (chunks.length > 0) {
+        if (params.signal?.aborted) return;
+        sseBuffer += chunks.shift()!;
+        const lines = sseBuffer.split("\n");
+        sseBuffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("data:")) {
+            const trimmed = line.substring(5).trim();
+            if (!trimmed || trimmed === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(trimmed);
+              const delta = getStreamingContent(parsed, "choices[0].delta.content");
+              if (delta) yield delta;
+            } catch {
+              // partial JSON
+            }
+          }
+        }
       }
-    } finally {
-      unlisten();
-      unlistenComplete();
+
+      if (streamDone) break;
     }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    yield `Pluely API Error: ${errorMessage}`;
+  } finally {
+    if (unlisten) unlisten();
   }
 }
 
 export async function* fetchAIResponse(params: {
-  provider: TYPE_PROVIDER | undefined;
+  provider: { id?: string; streaming?: boolean; responseContentPath?: string; isCustom?: boolean; curl: string } | undefined;
   selectedProvider: {
     provider: string;
     variables: Record<string, string>;
@@ -174,243 +445,30 @@ export async function* fetchAIResponse(params: {
   signal?: AbortSignal;
 }): AsyncIterable<string> {
   try {
-    const {
-      provider,
-      selectedProvider,
-      systemPrompt,
-      history = [],
-      userMessage,
-      imagesBase64 = [],
-      signal,
-    } = params;
+    const { systemPrompt, history = [], userMessage, imagesBase64 = [], signal } = params;
 
-    // Check if already aborted
-    if (signal?.aborted) {
-      return;
-    }
+    if (signal?.aborted) return;
 
     const enhancedSystemPrompt = buildEnhancedSystemPrompt(systemPrompt);
+    const mode: OpenClawMode =
+      (safeLocalStorage.getItem(STORAGE_KEYS.OPENCLAW_MODE) as OpenClawMode) || "responses";
 
-    // Check if we should use Pluely API instead
-    const usePluelyAPI = await shouldUsePluelyAPI();
-    if (usePluelyAPI) {
-      yield* fetchPluelyAIResponse({
-        systemPrompt: enhancedSystemPrompt,
-        userMessage,
-        imagesBase64,
-        history,
-        signal,
-      });
-      return;
-    }
-    if (!provider) {
-      throw new Error(`Provider not provided`);
-    }
-    if (!selectedProvider) {
-      throw new Error(`Selected provider not provided`);
-    }
-
-    let curlJson;
-    try {
-      curlJson = curl2Json(provider.curl);
-    } catch (error) {
-      throw new Error(
-        `Failed to parse curl: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
-      );
-    }
-
-    const extractedVariables = extractVariables(provider.curl);
-    const requiredVars = extractedVariables.filter(
-      ({ key }) => key !== "SYSTEM_PROMPT" && key !== "TEXT" && key !== "IMAGE"
-    );
-    for (const { key } of requiredVars) {
-      if (
-        !selectedProvider.variables?.[key] ||
-        selectedProvider.variables[key].trim() === ""
-      ) {
-        throw new Error(
-          `Missing required variable: ${key}. Please configure it in settings.`
-        );
-      }
-    }
-
-    if (!userMessage) {
-      throw new Error("User message is required");
-    }
-    if (imagesBase64.length > 0 && !provider.curl.includes("{{IMAGE}}")) {
-      throw new Error(
-        `Provider ${provider?.id ?? "unknown"} does not support image input`
-      );
-    }
-
-    let bodyObj: any = curlJson.data
-      ? JSON.parse(JSON.stringify(curlJson.data))
-      : {};
-    const messagesKey = Object.keys(bodyObj).find((key) =>
-      ["messages", "contents", "conversation", "history"].includes(key)
-    );
-
-    if (messagesKey && Array.isArray(bodyObj[messagesKey])) {
-      const finalMessages = buildDynamicMessages(
-        bodyObj[messagesKey],
-        history,
-        userMessage,
-        imagesBase64
-      );
-      bodyObj[messagesKey] = finalMessages;
-    }
-
-    const allVariables = {
-      ...Object.fromEntries(
-        Object.entries(selectedProvider.variables).map(([key, value]) => [
-          key.toUpperCase(),
-          value,
-        ])
-      ),
-      SYSTEM_PROMPT: enhancedSystemPrompt || "",
+    const sharedParams = {
+      systemPrompt: enhancedSystemPrompt,
+      userMessage,
+      imagesBase64,
+      history,
+      signal,
     };
 
-    bodyObj = deepVariableReplacer(bodyObj, allVariables);
-    let url = deepVariableReplacer(curlJson.url || "", allVariables);
-
-    const headers = deepVariableReplacer(curlJson.header || {}, allVariables);
-    headers["Content-Type"] = "application/json";
-
-    if (provider?.streaming) {
-      if (typeof bodyObj === "object" && bodyObj !== null) {
-        const streamKey = Object.keys(bodyObj).find(
-          (k) => k.toLowerCase() === "stream"
-        );
-        if (streamKey) {
-          bodyObj[streamKey] = true;
-        } else {
-          bodyObj.stream = true;
-        }
-      }
-    }
-
-    const fetchFunction = url?.includes("http") ? fetch : tauriFetch;
-
-    let response;
-    try {
-      response = await fetchFunction(url, {
-        method: curlJson.method || "POST",
-        headers,
-        body: curlJson.method === "GET" ? undefined : JSON.stringify(bodyObj),
-        signal,
-      });
-    } catch (fetchError) {
-      // Check if aborted
-      if (
-        signal?.aborted ||
-        (fetchError instanceof Error && fetchError.name === "AbortError")
-      ) {
-        return; // Silently return on abort
-      }
-      yield `Network error during API request: ${
-        fetchError instanceof Error ? fetchError.message : "Unknown error"
-      }`;
-      return;
-    }
-
-    if (!response.ok) {
-      let errorText = "";
-      try {
-        errorText = await response.text();
-      } catch {}
-      yield `API request failed: ${response.status} ${response.statusText}${
-        errorText ? ` - ${errorText}` : ""
-      }`;
-      return;
-    }
-
-    if (!provider?.streaming) {
-      let json;
-      try {
-        json = await response.json();
-      } catch (parseError) {
-        yield `Failed to parse non-streaming response: ${
-          parseError instanceof Error ? parseError.message : "Unknown error"
-        }`;
-        return;
-      }
-      const content =
-        getByPath(json, provider?.responseContentPath || "") || "";
-      yield content;
-      return;
-    }
-
-    if (!response.body) {
-      yield "Streaming not supported or response body missing";
-      return;
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      // Check if aborted
-      if (signal?.aborted) {
-        reader.cancel();
-        return;
-      }
-
-      let readResult;
-      try {
-        readResult = await reader.read();
-      } catch (readError) {
-        // Check if aborted
-        if (
-          signal?.aborted ||
-          (readError instanceof Error && readError.name === "AbortError")
-        ) {
-          return; // Silently return on abort
-        }
-        yield `Error reading stream: ${
-          readError instanceof Error ? readError.message : "Unknown error"
-        }`;
-        return;
-      }
-      const { done, value } = readResult;
-      if (done) break;
-
-      // Check if aborted before processing
-      if (signal?.aborted) {
-        reader.cancel();
-        return;
-      }
-
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (line.startsWith("data:")) {
-          const trimmed = line.substring(5).trim();
-          if (!trimmed || trimmed === "[DONE]") continue;
-          try {
-            const parsed = JSON.parse(trimmed);
-            const delta = getStreamingContent(
-              parsed,
-              provider?.responseContentPath || ""
-            );
-            if (delta) {
-              yield delta;
-            }
-          } catch (e) {
-            // Ignore parsing errors for partial JSON chunks
-          }
-        }
-      }
+    if (mode === "responses") {
+      yield* fetchOpenClawViaResponses(sharedParams);
+    } else {
+      yield* fetchOpenClawViaChatCompletions(sharedParams);
     }
   } catch (error) {
     throw new Error(
-      `Error in fetchAIResponse: ${
-        error instanceof Error ? error.message : "Unknown error"
-      }`
+      `Error in fetchAIResponse: ${error instanceof Error ? error.message : "Unknown error"}`
     );
   }
 }
